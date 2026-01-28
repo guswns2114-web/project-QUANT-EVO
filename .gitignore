@@ -1,38 +1,30 @@
-# === SQLite Database Files ===
+﻿# SQLite Database Files
 shared/data/*.db
 shared/data/*.db-shm
 shared/data/*.db-wal
 
-# === Logs ===
+# Logs
 shared/logs/
 *.log
 logs/
 
-# === Python Cache ===
+# Python Cache
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 .pytest_cache/
 *.egg-info/
 
-# === Virtual Environment ===
+# Virtual Environments
 .venv/
 venv/
 env/
 
-# === IDE & Editor ===
+# IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-*.sublime-project
 
-# === Environment Variables ===
+# Environment Variables
 .env
 .env.local
-.env.*.local
-
-# === OS Files ===
-.DS_Store
-Thumbs.db
