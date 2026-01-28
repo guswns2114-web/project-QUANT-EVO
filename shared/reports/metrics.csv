@@ -1,0 +1,12 @@
+metric_name,value
+total_events,20
+signal_created,10
+intent_inserted,0
+exec_sent,8
+exec_rejected,2
+sent_rate_percent,80.00
+rejected_rate_percent,20.00
+buy_actions,4
+sell_actions,4
+ai_score_sent_mean,0.6550
+ai_score_rejected_mean,0.7000

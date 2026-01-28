@@ -1,0 +1,39 @@
+{
+  "version": "2026-01-28_01",
+  "data_mode": "MOCK",
+  "mock_intents_per_min": 6,
+  "mock_symbols": ["005930"],
+  "mock_action_ratio_buy": 0.5,
+  "mock_ai_score_mean": 0.685,
+  "mock_ai_score_std": 0.05,
+  "dedupe_window_sec": 5,
+  "universe": {
+    "max_symbols": 3,
+    "allowed_markets": ["KOSDAQ", "KOSPI"],
+    "exclude_locked_limit": true
+  },
+  "signal": {
+    "window_sec": 30,
+    "vol_spike_min": 2.0,
+    "buy_ratio_min": 0.65,
+    "book_ratio_min": 1.30,
+    "require_price_above_vwap": true,
+    "breakout_hold_sec_max": 10,
+    "ai_score_cut": 0.70,
+    "signal_ttl_ms": 5000
+  },
+  "execution": {
+    "poll_interval_ms": 250,
+    "order_type": "MARKET",
+    "max_orders_per_day": 8,
+    "cooldown_sec": 30,
+    "one_position_only": true
+  },
+  "risk": {
+    "stop_loss_pct": 0.012,
+    "take_profit_pct": 0.03,
+    "daily_max_loss_pct": 0.03,
+    "kill_switch_on_errors": true,
+    "max_consecutive_losses": 2
+  }
+}

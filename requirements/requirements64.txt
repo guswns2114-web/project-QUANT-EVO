@@ -1,0 +1,5 @@
+python-dotenv
+numpy
+pandas
+scikit-learn
+xgboost
