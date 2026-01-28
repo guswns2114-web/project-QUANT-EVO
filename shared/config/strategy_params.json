@@ -20,13 +20,17 @@
     "require_price_above_vwap": true,
     "breakout_hold_sec_max": 10,
     "ai_score_cut": 0.70,
-    "signal_ttl_ms": 5000
+    "signal_ttl_ms": 60000,
+    "_comment_ttl": "TUNED: 5000->60000ms (test mode: 60sec signal window)"
   },
   "execution": {
-    "poll_interval_ms": 250,
+    "poll_interval_ms": 1000,
+    "_comment_poll": "TUNED: 250->1000ms (1sec polling cycle)",
     "order_type": "MARKET",
-    "max_orders_per_day": 8,
-    "cooldown_sec": 30,
+    "max_orders_per_day": 20,
+    "_comment_max_orders": "TUNED: 8->20 orders/day (test mode limit)",
+    "cooldown_sec": 10,
+    "_comment_cooldown": "TUNED: 30->10sec (faster re-entry)",
     "one_position_only": true
   },
   "risk": {

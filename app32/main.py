@@ -37,18 +37,19 @@ def load_params():
 
 def log_jsonl(event_type, symbol, action, ai_score, params_version_id, 
               rejection_reason=None, cooldown_sec=0, max_orders_per_day=0, 
-              one_position_only=False, **kwargs):
+              one_position_only=False, latency_ms=None, **kwargs):
     """
     Log execution events to JSON Lines format.
+    [TUNING v2] Added latency_ms field for performance tracking
     
     Example entries:
     EXEC_SENT:     {"ts":"2026-01-28T14:35:42.123Z","module":"APP32","event_type":"EXEC_SENT",
                     "symbol":"005930","action":"BUY","ai_score":0.75,"params_version_id":"2026-01-28_01",
-                    "params_snapshot":{"cooldown_sec":30,"max_orders_per_day":5,"one_position_only":true}}
+                    "latency_ms":125.5,"params_snapshot":{"cooldown_sec":30,"max_orders_per_day":5,"one_position_only":true}}
     
     EXEC_REJECTED: {"ts":"2026-01-28T14:35:42.123Z","module":"APP32","event_type":"EXEC_REJECTED",
                     "symbol":"005930","action":"BUY","ai_score":0.75,"params_version_id":"2026-01-28_01",
-                    "rejection_reason":"TTL_EXPIRED","context":{...}}
+                    "rejection_reason":"TTL_EXPIRED","latency_ms":1250.0,"context":{...}}
     """
     try:
         log_entry = {
@@ -60,6 +61,9 @@ def log_jsonl(event_type, symbol, action, ai_score, params_version_id,
             'ai_score': round(ai_score, 4),
             'params_version_id': params_version_id,
         }
+        
+        if latency_ms is not None:
+            log_entry['latency_ms'] = round(latency_ms, 2)
         
         if event_type == 'EXEC_SENT':
             log_entry['params_snapshot'] = {
@@ -78,9 +82,10 @@ def log_jsonl(event_type, symbol, action, ai_score, params_version_id,
     except Exception as e:
         print(f"[LOG_ERROR] {e}")
 
-def log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score, params_version_id, context=""):
+def log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score, params_version_id, context="", 
+                 latency_ms=None, received_at=None, executed_at=None):
     """
-    Structured execution log entry.
+    Structured execution log entry with latency tracking.
     
     Parameters:
     - ts: timestamp (YYYY-MM-DD HH:MM:SS.mmm)
@@ -92,12 +97,15 @@ def log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score
     - ai_score: signal confidence from APP64
     - params_version_id: strategy version for traceability
     - context: additional JSON context (timing info, counts, etc.)
+    - latency_ms: time from signal creation to execution (milliseconds)
+    - received_at: timestamp when APP32 received the signal (ISO 8601)
+    - executed_at: timestamp after broker.place_order call (ISO 8601)
     """
     conn.execute(
         "INSERT INTO execution_log "
-        "(ts, module, symbol, action, decision, rejection_reason, ai_score, params_version_id, context) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ts, "APP32", symbol, action, decision, rejection_reason, ai_score, params_version_id, context)
+        "(ts, module, symbol, action, decision, rejection_reason, ai_score, params_version_id, context, latency_ms, received_at, executed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, "APP32", symbol, action, decision, rejection_reason, ai_score, params_version_id, context, latency_ms, received_at, executed_at)
     )
     
     # Console output (legacy, kept for monitoring)
@@ -107,16 +115,19 @@ def log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score
         print(f"[{ts}] [APP32] [REJECTED] {symbol} {action} reason={rejection_reason} score={ai_score:.2f} ver={params_version_id}")
 
 def log_execution_with_jsonl(conn, ts, symbol, action, decision, rejection_reason, ai_score, params_version_id, 
-                             context="", cooldown_sec=0, max_orders_per_day=0, one_position_only=False):
+                             context="", cooldown_sec=0, max_orders_per_day=0, one_position_only=False,
+                             latency_ms=None, received_at=None, executed_at=None):
     """
     Combined DB and JSON Lines logging for execution events.
+    [TUNING v2] Added latency_ms, received_at, executed_at tracking
     """
-    log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score, params_version_id, context)
+    log_execution(conn, ts, symbol, action, decision, rejection_reason, ai_score, params_version_id, context,
+                 latency_ms=latency_ms, received_at=received_at, executed_at=executed_at)
     
     if decision == "SENT":
         log_jsonl('EXEC_SENT', symbol, action, ai_score, params_version_id,
                  cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                 one_position_only=one_position_only)
+                 one_position_only=one_position_only, latency_ms=latency_ms)
     else:  # REJECTED
         # Parse context JSON if available
         context_dict = {}
@@ -126,7 +137,7 @@ def log_execution_with_jsonl(conn, ts, symbol, action, decision, rejection_reaso
             except:
                 pass
         log_jsonl('EXEC_REJECTED', symbol, action, ai_score, params_version_id,
-                 rejection_reason=rejection_reason, **context_dict)
+                 rejection_reason=rejection_reason, latency_ms=latency_ms, **context_dict)
 
 def count_sent_buy_today(conn, trade_day=None):
     """
@@ -225,12 +236,39 @@ def main():
             print(f"[LIMIT] day changed -> reload sent BUY orders today = {buys_today} (day={current_day})")
 
         rows = conn.execute(
-            "SELECT id, ts, symbol, action, ai_score, params_version_id "
+            "SELECT id, ts, created_at, symbol, action, ai_score, params_version_id "
             "FROM orders_intent WHERE status='NEW' ORDER BY id ASC LIMIT 10"
         ).fetchall()
 
-        for intent_id, ts, symbol, action, score, ver in rows:
+        for intent_id, ts, created_at, symbol, action, score, ver in rows:
             current_ts = now_ms()
+            received_at = now_iso()  # [TUNING v2] Record when APP32 received this signal
+            
+            # ✅ [TUNING v2] Calculate latency_ms: time from signal creation to now
+            latency_ms = None
+            if created_at:
+                try:
+                    # Parse created_at: "2026-01-28 HH:MM:SS.mmm" format
+                    created_dt = datetime.strptime(created_at.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                    # Add milliseconds if present
+                    if '.' in created_at:
+                        ms = int(created_at.split('.')[1][:3])
+                        created_dt = created_dt.replace(microsecond=ms * 1000)
+                    latency_ms = (datetime.now() - created_dt).total_seconds() * 1000.0
+                except Exception as e:
+                    print(f"[LATENCY_ERROR] {e} (created_at={created_at})")
+                    latency_ms = None
+            elif ts:
+                # Fallback to ts column if created_at is NULL
+                try:
+                    intent_dt = datetime.strptime(ts.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                    if '.' in ts:
+                        ms = int(ts.split('.')[1][:3])
+                        intent_dt = intent_dt.replace(microsecond=ms * 1000)
+                    latency_ms = (datetime.now() - intent_dt).total_seconds() * 1000.0
+                except Exception as e:
+                    print(f"[LATENCY_ERROR_TS] {e} (ts={ts})")
+                    latency_ms = None
 
             # ✅ TTL 체크: 너무 오래된 신호는 폐기
             ttl_ms = params["signal"].get("signal_ttl_ms", 0)
@@ -243,7 +281,7 @@ def main():
                     log_execution_with_jsonl(
                         conn, current_ts, symbol, action, "REJECTED", RejectionReason.TTL_EXPIRED, score, ver, 
                         context=context, cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                        one_position_only=one_position_only
+                        one_position_only=one_position_only, latency_ms=latency_ms, received_at=received_at
                     )
                     conn.execute(
                         "UPDATE orders_intent SET status='REJECTED' WHERE id=?",
@@ -259,7 +297,7 @@ def main():
                     log_execution_with_jsonl(
                         conn, current_ts, symbol, action, "REJECTED", RejectionReason.DAILY_LIMIT, score, ver, 
                         context=context, cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                        one_position_only=one_position_only
+                        one_position_only=one_position_only, latency_ms=latency_ms, received_at=received_at
                     )
                     conn.execute(
                         "UPDATE orders_intent SET status='REJECTED' WHERE id=?",
@@ -277,7 +315,7 @@ def main():
                     log_execution_with_jsonl(
                         conn, current_ts, symbol, action, "REJECTED", RejectionReason.COOLDOWN, score, ver, 
                         context=context, cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                        one_position_only=one_position_only
+                        one_position_only=one_position_only, latency_ms=latency_ms, received_at=received_at
                     )
                     conn.execute(
                         "UPDATE orders_intent SET status='REJECTED' WHERE id=?",
@@ -292,7 +330,7 @@ def main():
                     log_execution_with_jsonl(
                         conn, current_ts, symbol, action, "REJECTED", RejectionReason.ONE_POSITION, score, ver, 
                         context=context, cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                        one_position_only=one_position_only
+                        one_position_only=one_position_only, latency_ms=latency_ms, received_at=received_at
                     )
                     conn.execute(
                         "UPDATE orders_intent SET status='REJECTED' WHERE id=?",
@@ -308,6 +346,7 @@ def main():
                 order_type='market',
                 quantity=1
             )
+            executed_at = now_iso()  # [TUNING v2] Record execution timestamp
             
             # 2. 주문 결과 로깅 및 DB 업데이트
             if broker_result.success:
@@ -319,7 +358,8 @@ def main():
                     conn, current_ts, symbol, action, "SENT", None, score, ver, 
                     context=json.dumps(broker_result.context or {}), 
                     cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                    one_position_only=one_position_only
+                    one_position_only=one_position_only, latency_ms=latency_ms, 
+                    received_at=received_at, executed_at=executed_at
                 )
                 
                 # orders_intent 상태 업데이트
@@ -335,7 +375,8 @@ def main():
                     RejectionReason.BROKER_ERROR, score, ver, 
                     context=f'{{"broker_error": "{broker_result.reason}"}}', 
                     cooldown_sec=cooldown_sec, max_orders_per_day=max_orders_per_day, 
-                    one_position_only=one_position_only
+                    one_position_only=one_position_only, latency_ms=latency_ms, 
+                    received_at=received_at, executed_at=executed_at
                 )
                 conn.execute(
                     "UPDATE orders_intent SET status='REJECTED' WHERE id=?",

@@ -27,7 +27,9 @@ def init_schema(conn):
     """
     스키마 초기화 및 마이그레이션 (완전 이등분성: 여러 번 안전).
     - orders_intent: ts, created_at, trade_day, symbol, action, ai_score, ttl_ms, params_version_id, status
-    - execution_log: ts, module, symbol, action, decision, rejection_reason, ai_score, params_version_id, order_id, context
+    - execution_log: ts, module, symbol, action, decision, rejection_reason, ai_score, params_version_id, order_id, context, latency_ms, received_at, executed_at
+    
+    [TUNING v2] Added latency tracking columns for execution analysis
     """
     # CREATE TABLE: 스키마 완전 정의 (IF NOT EXISTS 안전)
     conn.executescript("""
@@ -55,9 +57,25 @@ def init_schema(conn):
         ai_score REAL NOT NULL,
         params_version_id TEXT NOT NULL,
         order_id TEXT,
-        context TEXT
+        context TEXT,
+        latency_ms REAL,
+        received_at TEXT,
+        executed_at TEXT
     );
     """)
+    
+    # Migration: Add latency_ms, received_at, executed_at columns if missing
+    if not _column_exists(conn, 'execution_log', 'latency_ms'):
+        conn.execute("ALTER TABLE execution_log ADD COLUMN latency_ms REAL;")
+        print("[MIGRATE] Added latency_ms column to execution_log")
+    
+    if not _column_exists(conn, 'execution_log', 'received_at'):
+        conn.execute("ALTER TABLE execution_log ADD COLUMN received_at TEXT;")
+        print("[MIGRATE] Added received_at column to execution_log")
+    
+    if not _column_exists(conn, 'execution_log', 'executed_at'):
+        conn.execute("ALTER TABLE execution_log ADD COLUMN executed_at TEXT;")
+        print("[MIGRATE] Added executed_at column to execution_log")
     
     # 마이그레이션 1: orders_intent에 created_at 추가 (이미 있으면 무시)
     if not _column_exists(conn, 'orders_intent', 'created_at'):
