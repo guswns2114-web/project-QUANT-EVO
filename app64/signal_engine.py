@@ -1,12 +1,27 @@
 import json, random, time
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import deque
 import os, sys, stat, subprocess, atexit
 from db import connect, init_schema, get_kst_date
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "shared" / "config" / "strategy_params.json"
 LOGS_PATH = Path(__file__).resolve().parents[1] / "shared" / "logs"
 LOGS_PATH.mkdir(parents=True, exist_ok=True)
+
+# ========== [TUNING v3] SIGNAL QUALITY GATES ==========
+# TEST_MODE_THRESHOLD: Minimum ai_score to generate signal
+# Below this threshold, signals are silently skipped (no REJECTED log)
+TEST_MODE_THRESHOLD = 0.62
+
+# DUPLICATE_COOLDOWN_SEC: Skip duplicate (symbol, action) within this window
+DUPLICATE_COOLDOWN_SEC = 10
+
+# BURST_GUARD_WINDOW_SEC: Observation window for burst detection
+# BURST_GUARD_LIMIT: If N signals in window, block all signals for next window
+BURST_GUARD_WINDOW_SEC = 5
+BURST_GUARD_LIMIT = 3
+# ========== END TUNING v3 ==========
 
 # ========== SINGLE-INSTANCE LOCK MECHANISM ==========
 LOCK_FILE = Path(__file__).resolve().parents[1] / "shared" / ".signal_engine.lock"
@@ -186,11 +201,15 @@ def select_symbol(symbols, last_seen, dedupe_window_sec):
 def log_jsonl(event_type, symbol, action, ai_score, params_version_id, ttl_ms, **kwargs):
     """
     Log signal events to JSON Lines format.
+    [TUNING v3] Extended to support SIGNAL_SKIPPED events
     
-    Example entry:
-    {"ts":"2026-01-28T14:35:42.123Z","module":"APP64","event_type":"SIGNAL_CREATED",
-     "symbol":"005930","action":"BUY","ai_score":0.75,"params_version_id":"2026-01-28_01",
-     "ttl_ms":5000,"metadata":{...}}
+    Example entries:
+    SIGNAL_CREATED:    {"ts":"2026-01-28T14:35:42.123Z","module":"APP64","event_type":"SIGNAL_CREATED",
+                        "symbol":"005930","action":"BUY","ai_score":0.75,"params_version_id":"2026-01-28_01",
+                        "ttl_ms":5000,"metadata":{...}}
+    
+    SIGNAL_SKIPPED:    {"ts":"2026-01-28T14:35:42.123Z","module":"APP64","event_type":"SIGNAL_SKIPPED",
+                        "symbol":"005930","action":"BUY","reason":"DUPLICATE_COOLDOWN"} (no ai_score/ttl_ms)
     """
     try:
         log_entry = {
@@ -199,10 +218,14 @@ def log_jsonl(event_type, symbol, action, ai_score, params_version_id, ttl_ms, *
             'event_type': event_type,
             'symbol': symbol,
             'action': action,
-            'ai_score': round(ai_score, 4),
-            'params_version_id': params_version_id,
-            'ttl_ms': ttl_ms,
         }
+        
+        # Only include score/ttl for SIGNAL_CREATED events
+        if event_type == 'SIGNAL_CREATED':
+            log_entry['ai_score'] = round(ai_score, 4)
+            log_entry['params_version_id'] = params_version_id
+            log_entry['ttl_ms'] = ttl_ms
+        
         # Add any additional metadata
         log_entry.update(kwargs)
         
@@ -235,6 +258,14 @@ def main():
     print("[APP64] MOCK-ONLY MODE STARTED", now())
 
     mock_last_seen = {}
+    
+    # [TUNING v3] Signal Quality Filters
+    # 1. Duplicate Cooldown: Track (symbol, action) -> last_signal_time
+    recent_signal_ts = {}  # key: (symbol, action), value: unix_timestamp
+    
+    # 2. Burst Guard: Track signal creation times (sliding window)
+    signal_creation_times = deque()  # max length = window size
+    burst_guard_active_until = 0.0  # If time.time() < this, all signals blocked
 
     while True:
         # ====== LOAD CONFIGURATION ONCE PER LOOP ======
@@ -262,6 +293,60 @@ def main():
         
         # Generate action (BUY or SELL) based on ratio
         action = "BUY" if random.random() < mock_action_ratio_buy else "SELL"
+        
+        # ========== [TUNING v3] APPLY SIGNAL QUALITY GATES ==========
+        now_ts = time.time()
+        skip_reason = None
+        
+        # GATE 1: TEST_MODE_THRESHOLD - Skip low-confidence signals silently
+        if score < TEST_MODE_THRESHOLD:
+            skip_reason = "LOW_AI_SCORE"
+            # No logging - silently discard
+        
+        # GATE 2: DUPLICATE_COOLDOWN - Skip if same (symbol, action) within cooldown window
+        if not skip_reason:
+            key = (sym, action)
+            last_signal = recent_signal_ts.get(key, 0.0)
+            if (now_ts - last_signal) < DUPLICATE_COOLDOWN_SEC:
+                skip_reason = "DUPLICATE_COOLDOWN"
+        
+        # GATE 3: BURST_GUARD - Check if we should block all signals
+        if not skip_reason:
+            # Clean up old timestamps outside window
+            while signal_creation_times and (now_ts - signal_creation_times[0]) >= BURST_GUARD_WINDOW_SEC:
+                signal_creation_times.popleft()
+            
+            # Check if burst guard is still active
+            if now_ts < burst_guard_active_until:
+                skip_reason = "BURST_GUARD"
+            # Check if we're entering burst state (N signals in short window)
+            elif len(signal_creation_times) >= BURST_GUARD_LIMIT:
+                skip_reason = "BURST_GUARD"
+                burst_guard_active_until = now_ts + BURST_GUARD_WINDOW_SEC
+        
+        # ====== IF SKIP: LOG AND CONTINUE ======
+        if skip_reason:
+            # Log skip event (all skip reasons except LOW_AI_SCORE get logged)
+            if skip_reason != "LOW_AI_SCORE":
+                log_jsonl(
+                    'SIGNAL_SKIPPED',
+                    sym,
+                    action,
+                    score,
+                    ver,
+                    ttl,
+                    reason=skip_reason
+                )
+            # Move to next iteration
+            time.sleep(60.0 / max(mock_intents_per_min, 0.1))
+            continue
+        
+        # ========== SIGNAL ACCEPTED: GENERATE ==========
+        # Track this signal for duplicate detection
+        recent_signal_ts[(sym, action)] = now_ts
+        
+        # Record creation time for burst guard
+        signal_creation_times.append(now_ts)
         
         # Get KST trade_day for DAILY_LIMIT tracking
         trade_day = get_kst_date()
